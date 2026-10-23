@@ -70,5 +70,4 @@ export const publicConfig = {
   privacyUrl: process.env.NEXT_PUBLIC_PRIVACY_URL || '/privacy',
   termsUrl: process.env.NEXT_PUBLIC_TERMS_URL || undefined,
   supportEmail: process.env.NEXT_PUBLIC_SUPPORT_EMAIL || undefined,
-  turnstileSiteKey: process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY || undefined,
 };

@@ -15,6 +15,27 @@ interface Pending {
   error?: string;
 }
 
+/** Photos are resized in the browser so the whole form stays small enough to send reliably. */
+const UPLOAD_TARGET = 1.5 * 1024 * 1024;
+async function shrink(f: File): Promise<File> {
+  if (f.size <= UPLOAD_TARGET || !f.type.startsWith('image/')) return f;
+  try {
+    const bmp = await createImageBitmap(f);
+    const scale = Math.min(1, 2000 / Math.max(bmp.width, bmp.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(bmp.width * scale);
+    canvas.height = Math.round(bmp.height * scale);
+    canvas.getContext('2d')!.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+    for (const q of [0.85, 0.75, 0.65, 0.55]) {
+      const blob = await new Promise<Blob | null>((r) => canvas.toBlob(r, 'image/jpeg', q));
+      if (blob && blob.size <= UPLOAD_TARGET) return new File([blob], f.name.replace(/\.[^.]+$/, '') + '.jpg', { type: 'image/jpeg' });
+    }
+  } catch {
+    /* fall through: upload as-is and let the server decide */
+  }
+  return f;
+}
+
 function checkFile(f: File, accept: NonNullable<Field['accept']>): string | null {
   const isImg = /^image\/(jpeg|png|webp|heic|heif)$/.test(f.type) || /\.(jpe?g|png|webp|heic|heif)$/i.test(f.name);
   const isVid = /^video\/(mp4|quicktime)$/.test(f.type) || /\.(mp4|mov)$/i.test(f.name);
@@ -55,7 +76,8 @@ export function FilesInput({ field, id }: { field: Field; id: string }) {
       setPending((p) => [...p, { key, name: f.name, progress: 0 }]);
       try {
         const oldIds = replace ? mine.map((m) => m.id) : [];
-        await env.upload(category, f, (pct) => setPending((p) => p.map((x) => (x.key === key ? { ...x, progress: pct } : x))));
+        const toSend = await shrink(f);
+        await env.upload(category, toSend, (pct) => setPending((p) => p.map((x) => (x.key === key ? { ...x, progress: pct } : x))));
         for (const old of oldIds) await env.remove(old);
         setPending((p) => p.filter((x) => x.key !== key));
       } catch (e) {

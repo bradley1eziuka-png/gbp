@@ -16,6 +16,7 @@ export function ReviewScreen({
   onSubmit,
   submitting,
   submitError,
+  onSubmitWithoutPhotos,
 }: {
   data: FormData;
   files: FileMeta[];
@@ -24,6 +25,7 @@ export function ReviewScreen({
   onSubmit: () => void;
   submitting: boolean;
   submitError: string | null;
+  onSubmitWithoutPhotos?: () => void;
 }) {
   const sections = useMemo(() => buildSummary(data, files), [data, files]);
   const followUps = useMemo(
@@ -41,7 +43,7 @@ export function ReviewScreen({
       <h2 className="step-title" tabIndex={-1} id="step-heading">
         Review your answers
       </h2>
-      <p className="step-intro">Check your answers. Use “Edit” to change anything. Nothing is sent until you press Submit.</p>
+      <p className="step-intro">Check your answers. Use “Edit” to change anything. Nothing is sent to Arclo until you press Submit.</p>
 
       {problemSteps.length > 0 && (
         <div className="error-summary" role="alert">
@@ -99,6 +101,13 @@ export function ReviewScreen({
         {submitError && (
           <div className="error-summary" role="alert">
             {submitError}
+            {onSubmitWithoutPhotos && (
+              <div style={{ marginTop: 10 }}>
+                <button type="button" className="btn secondary small" onClick={onSubmitWithoutPhotos} disabled={submitting}>
+                  Submit without photos
+                </button>
+              </div>
+            )}
           </div>
         )}
       </div>

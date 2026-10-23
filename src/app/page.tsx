@@ -1,13 +1,5 @@
-import { StartForm } from '@/components/StartForm';
-import { Header } from '@/components/ui';
+import { Wizard } from '@/components/Wizard';
 
 export default function Home() {
-  return (
-    <>
-      <Header />
-      <main className="shell">
-        <StartForm />
-      </main>
-    </>
-  );
+  return <Wizard />;
 }

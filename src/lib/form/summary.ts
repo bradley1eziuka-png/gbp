@@ -16,7 +16,7 @@ export interface SummarySection {
   rows: SummaryRow[];
 }
 
-const fmtTime = (t?: string) => {
+export const fmtTime = (t?: string) => {
   if (!t) return '?';
   const [h, m] = t.split(':').map(Number);
   const ap = h >= 12 ? 'PM' : 'AM';

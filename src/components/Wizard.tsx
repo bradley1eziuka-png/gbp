@@ -1,8 +1,8 @@
 'use client';
 
-import Link from 'next/link';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { buildContext, visibleSteps } from '@/lib/form/logic';
+import { buildPayload, FORMSPREE_ENDPOINT, makeReference } from '@/lib/form/payload';
 import { STEPS } from '@/lib/form/steps';
 import type { FileMeta, FormData, Step } from '@/lib/form/types';
 import { validateAll, validateStep, type Errors } from '@/lib/form/validate';
@@ -10,10 +10,12 @@ import { Confirmation } from './Confirmation';
 import { FormEnvContext } from './env';
 import { domId, FieldList } from './FieldView';
 import { ReviewScreen } from './ReviewScreen';
+import { StartScreen } from './StartScreen';
 import { Header, publicConfig } from './ui';
 
-type SaveState = 'idle' | 'saving' | 'saved' | 'error';
-const TOKEN_KEY = 'arclo.gbp.token';
+const SNAP_KEY = 'arclo.gbp.progress';
+const DONE_KEY = 'arclo.gbp.submitted';
+const MAX_TOTAL_BYTES = 8 * 1024 * 1024; // keep one submission comfortably small for Formspree
 
 const DEFAULTS: FormData = {};
 for (const s of STEPS) for (const f of s.fields) if (f.defaultValue !== undefined) DEFAULTS[f.id] = f.defaultValue;
@@ -26,30 +28,40 @@ function findLabel(step: Step, path: string): string {
   return f.label;
 }
 
-export function Wizard({ token }: { token: string }) {
-  const [phase, setPhase] = useState<'loading' | 'invalid' | 'ready' | 'done'>('loading');
+const readSession = (k: string): string | null => {
+  try {
+    return sessionStorage.getItem(k);
+  } catch {
+    return null;
+  }
+};
+const writeSession = (k: string, v: string | null) => {
+  try {
+    if (v === null) sessionStorage.removeItem(k);
+    else sessionStorage.setItem(k, v);
+  } catch {
+    /* storage unavailable: the form still works, just without tab persistence */
+  }
+};
+
+export function Wizard() {
+  const [phase, setPhase] = useState<'loading' | 'start' | 'form' | 'done'>('loading');
   const [data, setData] = useState<FormData>({});
   const [files, setFiles] = useState<FileMeta[]>([]);
+  const fileStore = useRef(new Map<string, File>());
   const [previews, setPreviews] = useState<Record<string, string>>({});
   const [stepIndex, setStepIndex] = useState(0);
   const [furthest, setFurthest] = useState(0);
   const [errors, setErrors] = useState<Errors>({});
   const [showSummary, setShowSummary] = useState(false);
   const [stepErrors, setStepErrors] = useState<Record<string, Errors>>({});
-  const [saveState, setSaveState] = useState<SaveState>('idle');
-  const [savedAt, setSavedAt] = useState<Date | null>(null);
-  const [panel, setPanel] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
-  const [result, setResult] = useState<{ id: string; emailsConfigured: boolean } | null>(null);
-  const [alreadySubmitted, setAlreadySubmitted] = useState<string | null>(null);
-  const [mailStatus, setMailStatus] = useState<string | null>(null);
-
-  const dirty = useRef(false);
-  const latest = useRef({ data, stepIndex });
-  latest.current = { data, stepIndex };
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const saving = useRef(false);
+  const [fileProblem, setFileProblem] = useState(false);
+  const [done, setDone] = useState<{ ref: string; email: string; photos: boolean } | null>(null);
+  const inFlight = useRef(false);
+  const honeypot = useRef('');
+  const reference = useRef('');
   const headingRef = useRef<HTMLHeadingElement>(null);
 
   const steps = useMemo(() => visibleSteps(STEPS, data), [data]);
@@ -58,86 +70,48 @@ export function Wizard({ token }: { token: string }) {
   const step = isReview ? null : steps[stepIndex];
   const ctx = useMemo(() => buildContext(data), [data]);
 
-  /* ---------------------------- load draft ---------------------------- */
+  /* ---------------- restore tab progress / already-submitted ---------------- */
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
+    const submitted = readSession(DONE_KEY);
+    if (submitted) {
       try {
-        const res = await fetch(`/api/drafts/${token}`, { cache: 'no-store' });
-        if (!res.ok) throw new Error('invalid');
-        const body = (await res.json()) as { data: FormData; step: number; files: FileMeta[]; submitted: string | null };
-        if (cancelled) return;
-        if (body.submitted) {
-          setAlreadySubmitted(body.submitted);
-          setPhase('done');
-          return;
-        }
-        setData({ ...DEFAULTS, ...body.data });
-        setFiles(body.files);
-        setStepIndex(Math.max(0, body.step));
-        setFurthest(Math.max(0, body.step));
-        setPhase('ready');
-        try {
-          localStorage.setItem(TOKEN_KEY, token); // token only, answers never stored in the browser
-        } catch {}
+        const j = JSON.parse(submitted) as { ref: string; email: string; photos: boolean };
+        setDone(j);
+        setPhase('done');
+        return;
       } catch {
-        if (!cancelled) setPhase('invalid');
+        writeSession(DONE_KEY, null);
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [token]);
-
-  /* ----------------------------- autosave ----------------------------- */
-  const save = useCallback(
-    async (keepalive = false) => {
-      if (!dirty.current || saving.current) return;
-      dirty.current = false;
-      saving.current = true;
-      setSaveState('saving');
+    }
+    const snap = readSession(SNAP_KEY);
+    if (snap) {
       try {
-        const res = await fetch(`/api/drafts/${token}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ data: latest.current.data, step: latest.current.stepIndex }),
-          keepalive,
-        });
-        if (!res.ok) throw new Error(String(res.status));
-        setSaveState('saved');
-        setSavedAt(new Date());
+        const j = JSON.parse(snap) as { data: FormData; step: number; furthest: number };
+        setData({ ...DEFAULTS, ...j.data });
+        setStepIndex(j.step);
+        setFurthest(j.furthest);
+        setPhase('form');
+        return;
       } catch {
-        dirty.current = true;
-        setSaveState('error');
-        timer.current = setTimeout(() => void save(), 5000);
-      } finally {
-        saving.current = false;
-        if (dirty.current && !timer.current) timer.current = setTimeout(() => ((timer.current = null), void save()), 1200);
+        writeSession(SNAP_KEY, null);
       }
-    },
-    [token],
-  );
+    }
+    setPhase('start');
+  }, []);
 
-  const queueSave = useCallback(() => {
-    dirty.current = true;
-    if (timer.current) clearTimeout(timer.current);
-    timer.current = setTimeout(() => {
-      timer.current = null;
-      void save();
-    }, 1200);
-  }, [save]);
-
+  // Keep answers (never files) in this tab's session storage while working.
   useEffect(() => {
-    const onHide = () => {
-      if (document.visibilityState === 'hidden') {
-        if (timer.current) clearTimeout(timer.current);
-        timer.current = null;
-        void save(true);
-      }
-    };
-    document.addEventListener('visibilitychange', onHide);
-    return () => document.removeEventListener('visibilitychange', onHide);
-  }, [save]);
+    if (phase === 'form') writeSession(SNAP_KEY, JSON.stringify({ data, step: stepIndex, furthest }));
+  }, [phase, data, stepIndex, furthest]);
+
+  const begin = (name: string, email: string, hp: string) => {
+    honeypot.current = hp;
+    setData({ ...DEFAULTS, contactName: name, contactEmail: email });
+    setStepIndex(0);
+    setFurthest(0);
+    setPhase('form');
+    window.scrollTo({ top: 0 });
+  };
 
   /* ----------------------------- data ops ----------------------------- */
   const onChange = (id: string, v: unknown) => {
@@ -148,56 +122,34 @@ export function Wizard({ token }: { token: string }) {
       for (const k of Object.keys(n)) if (k === id || k.startsWith(`${id}.`)) delete n[k];
       return n;
     });
-    queueSave();
   };
   const onSkip = (id: string, v: boolean) => {
     setData((d) => ({ ...d, _skipped: { ...((d._skipped as Record<string, boolean>) ?? {}), [id]: v } }));
     if (v) setErrors((e) => Object.fromEntries(Object.entries(e).filter(([k]) => k !== id)));
-    queueSave();
   };
 
   /* ------------------------------ files ------------------------------- */
-  const upload = useCallback(
-    (category: string, file: File, onProgress: (n: number) => void) =>
-      new Promise<FileMeta>((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-        xhr.open('POST', `/api/drafts/${token}/files`);
-        xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(Math.round((e.loaded / e.total) * 100));
-        xhr.onload = () => {
-          let body: { file?: FileMeta; error?: string } = {};
-          try {
-            body = JSON.parse(xhr.responseText);
-          } catch {}
-          if (xhr.status >= 200 && xhr.status < 300 && body.file) {
-            const meta = body.file;
-            setFiles((f) => [...f, meta]);
-            if (meta.mime.startsWith('image/')) setPreviews((p) => ({ ...p, [meta.id]: URL.createObjectURL(file) }));
-            resolve(meta);
-          } else reject(new Error(body.error ?? 'Upload failed. Please try again.'));
-        };
-        xhr.onerror = () => reject(new Error('Network error. Check your connection and try again.'));
-        const fd = new FormData();
-        fd.append('category', category);
-        fd.append('file', file);
-        xhr.send(fd);
-      }),
-    [token],
-  );
-  const remove = useCallback(
-    async (id: string) => {
-      const res = await fetch(`/api/drafts/${token}/files?id=${id}`, { method: 'DELETE' });
-      if (res.ok) {
-        setFiles((f) => f.filter((x) => x.id !== id));
-        setPreviews((p) => {
-          if (p[id]) URL.revokeObjectURL(p[id]);
-          const { [id]: _drop, ...rest } = p;
-          void _drop;
-          return rest;
-        });
-      }
-    },
-    [token],
-  );
+  const upload = useCallback(async (category: string, file: File, onProgress: (n: number) => void) => {
+    const used = Array.from(fileStore.current.values()).reduce((n, f) => n + f.size, 0);
+    if (used + file.size > MAX_TOTAL_BYTES)
+      throw new Error('That is the most we can attach to one form. Please send any extra photos to Arclo separately.');
+    const meta: FileMeta = { id: crypto.randomUUID(), category, name: file.name, mime: file.type || 'application/octet-stream', size: file.size };
+    fileStore.current.set(meta.id, file);
+    setFiles((f) => [...f, meta]);
+    if (file.type.startsWith('image/')) setPreviews((p) => ({ ...p, [meta.id]: URL.createObjectURL(file) }));
+    onProgress(100);
+    return meta;
+  }, []);
+  const remove = useCallback(async (id: string) => {
+    fileStore.current.delete(id);
+    setFiles((f) => f.filter((x) => x.id !== id));
+    setPreviews((p) => {
+      if (p[id]) URL.revokeObjectURL(p[id]);
+      const { [id]: _drop, ...rest } = p;
+      void _drop;
+      return rest;
+    });
+  }, []);
 
   /* ---------------------------- navigation ---------------------------- */
   const goto = (i: number) => {
@@ -205,8 +157,6 @@ export function Wizard({ token }: { token: string }) {
     setShowSummary(false);
     setStepIndex(i);
     setFurthest((f) => Math.max(f, i));
-    dirty.current = true;
-    queueSave();
     requestAnimationFrame(() => {
       window.scrollTo({ top: 0, behavior: 'smooth' });
       headingRef.current?.focus({ preventScroll: true });
@@ -235,56 +185,69 @@ export function Wizard({ token }: { token: string }) {
     goto(stepIndex + 1);
   };
 
-  const submit = async () => {
+  /* ------------------------ submit directly to Formspree ------------------------ */
+  const submit = async (withPhotos = true) => {
+    if (inFlight.current) return; // a second click while a request is running does nothing
     setSubmitError(null);
+    setFileProblem(false);
     const { byStep } = validateAll(data);
     setStepErrors(byStep);
     if (Object.keys(byStep).length) {
       setSubmitError('Please fix the highlighted sections above before submitting.');
       return;
     }
+    inFlight.current = true;
     setSubmitting(true);
     try {
-      if (timer.current) clearTimeout(timer.current);
-      timer.current = null;
-      dirty.current = true;
-      saving.current = false;
-      await save();
-      const res = await fetch(`/api/drafts/${token}/submit`, { method: 'POST' });
-      const body = (await res.json()) as { submissionId?: string; emailsConfigured?: boolean; error?: string; errors?: Errors };
-      if (!res.ok || !body.submissionId) {
-        if (body.errors) {
-          const grouped: Record<string, Errors> = {};
-          for (const s of STEPS) {
-            const e = validateStep(s, data);
-            if (Object.keys(e).length) grouped[s.id] = e;
-          }
-          setStepErrors(grouped);
+      if (!reference.current) reference.current = makeReference();
+      const attached = withPhotos
+        ? files.filter((f) => fileStore.current.has(f.id)).map((f) => ({ category: f.category as 'logo' | 'photos', name: f.name }))
+        : [];
+      const payload = buildPayload(data, reference.current, attached);
+      if (honeypot.current) payload._gotcha = honeypot.current;
+
+      let init: RequestInit;
+      if (attached.length) {
+        const fd = new window.FormData();
+        for (const [k, v] of Object.entries(payload)) fd.append(k, v);
+        let n = 0;
+        for (const f of files) {
+          const file = fileStore.current.get(f.id);
+          if (file) fd.append(f.category === 'logo' ? 'Logo' : `Photo ${++n}`, file, f.name);
         }
-        throw new Error(body.error ?? 'Submission failed.');
+        init = { method: 'POST', headers: { Accept: 'application/json' }, body: fd };
+      } else {
+        init = { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify(payload) };
       }
-      try {
-        localStorage.removeItem(TOKEN_KEY);
-      } catch {}
-      setResult({ id: body.submissionId, emailsConfigured: !!body.emailsConfigured });
+
+      const res = await fetch(FORMSPREE_ENDPOINT, init);
+      const body = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string; errors?: { code?: string; message?: string }[] };
+      if (!res.ok || body.ok === false) {
+        const codes = (body.errors ?? []).map((e) => e.code ?? '');
+        if (attached.length && codes.some((c) => ['NO_FILE_UPLOADS', 'TOO_MANY_FILES', 'FILES_TOO_BIG'].includes(c))) {
+          setFileProblem(true);
+          throw new Error('Your photos could not be sent with the form. You can submit without them and send them to Arclo separately.');
+        }
+        if (res.status === 429) throw new Error('Too many submissions right now. Please wait a minute and try again.');
+        throw new Error('We couldn’t send your form just now. Your answers are still here. Please try again in a moment.');
+      }
+      const result = { ref: reference.current, email: String(data.contactEmail ?? ''), photos: attached.length > 0 };
+      writeSession(DONE_KEY, JSON.stringify(result));
+      writeSession(SNAP_KEY, null);
+      setDone(result);
       setPhase('done');
       window.scrollTo({ top: 0 });
     } catch (e) {
-      setSubmitError(e instanceof Error ? e.message : 'Submission failed. Please try again.');
+      setSubmitError(
+        e instanceof TypeError
+          ? 'We couldn’t reach the server. Please check your internet connection and try again. Your answers are still here.'
+          : e instanceof Error
+            ? e.message
+            : 'Submission failed. Please try again.',
+      );
     } finally {
+      inFlight.current = false;
       setSubmitting(false);
-    }
-  };
-
-  const resumeUrl = typeof window !== 'undefined' ? `${window.location.origin}/form/${token}` : '';
-  const emailLink = async () => {
-    setMailStatus('sending');
-    try {
-      const res = await fetch(`/api/drafts/${token}/email-link`, { method: 'POST' });
-      const b = (await res.json()) as { status?: string };
-      setMailStatus(res.ok ? (b.status ?? 'failed') : 'failed');
-    } catch {
-      setMailStatus('failed');
     }
   };
 
@@ -294,42 +257,10 @@ export function Wizard({ token }: { token: string }) {
     [files, previews, upload, remove],
   );
 
-  if (phase === 'loading')
-    return (
-      <>
-        <Header />
-        <main className="shell"><p className="muted" role="status">Loading your form…</p></main>
-      </>
-    );
-  if (phase === 'invalid')
-    return (
-      <>
-        <Header />
-        <main className="shell hero">
-          <div className="card"><div className="card-body">
-            <h1 className="step-title">This link isn’t valid</h1>
-            <p>It may have expired (links last 60 days after your last save) or been copied incorrectly. You can start again, or contact Arclo if you need your earlier answers.</p>
-            <Link className="btn" href="/">Start a new form</Link>
-          </div></div>
-        </main>
-      </>
-    );
-  if (phase === 'done')
-    return (
-      <>
-        <Header />
-        <main className="shell">
-          {result ? (
-            <Confirmation submissionId={result.id} email={String(data.contactEmail ?? '')} emailsConfigured={result.emailsConfigured} data={data} files={files} />
-          ) : (
-            <div className="hero"><div className="card"><div className="card-body">
-              <h1 className="step-title">Already submitted</h1>
-              <p>This form was submitted{alreadySubmitted ? <> (reference <strong>{alreadySubmitted}</strong>)</> : null}. Contact Arclo if you need to change anything.</p>
-            </div></div></div>
-          )}
-        </main>
-      </>
-    );
+  if (phase === 'loading') return <><Header /><main className="shell"><p className="muted" role="status">Loading…</p></main></>;
+  if (phase === 'start') return <><Header /><main className="shell"><StartScreen onStart={begin} /></main></>;
+  if (phase === 'done' && done)
+    return <><Header /><main className="shell"><Confirmation reference={done.ref} email={done.email} photosAttached={done.photos} /></main></>;
 
   const pct = Math.round((stepIndex / total) * 100);
   const phases = ['all'];
@@ -337,37 +268,8 @@ export function Wizard({ token }: { token: string }) {
 
   return (
     <FormEnvContext.Provider value={env}>
-      <Header
-        right={
-          <button type="button" className="header-link" onClick={() => setPanel((p) => !p)} aria-expanded={panel}>
-            Save &amp; finish later
-          </button>
-        }
-      />
+      <Header />
       <main className="shell">
-        {panel && (
-          <div className="panel" style={{ marginBottom: 20 }} role="region" aria-label="Save and resume">
-            <h2 style={{ fontSize: '1.0625rem', marginBottom: 6 }}>Your progress is saved automatically</h2>
-            <p className="small muted">
-              Use this private link to come back any time in the next 60 days. Treat it like a password: anyone with the link can view and edit your answers.
-              Never forward it.
-            </p>
-            <div className="link-box">
-              <input readOnly value={resumeUrl} aria-label="Your private resume link" onFocus={(e) => e.currentTarget.select()} />
-              <button type="button" className="btn secondary small" onClick={() => navigator.clipboard?.writeText(resumeUrl)}>Copy link</button>
-              <button type="button" className="btn secondary small" onClick={emailLink} disabled={mailStatus === 'sending'}>Email it to me</button>
-            </div>
-            {mailStatus && mailStatus !== 'sending' && (
-              <p className="small" role="status" style={{ marginTop: 8 }}>
-                {mailStatus === 'sent' && 'Sent. Check your inbox (and spam folder).'}
-                {mailStatus === 'not_configured' && 'Email is not set up on this system, so nothing was sent. Please copy the link above and keep it somewhere safe.'}
-                {mailStatus === 'failed' && 'The email could not be sent. Please copy the link above instead.'}
-              </p>
-            )}
-            <button type="button" className="btn ghost small" style={{ marginTop: 8 }} onClick={() => setPanel(false)}>Close</button>
-          </div>
-        )}
-
         <div className="progress-mobile">
           <div className="progress-meta">
             <strong>{isReview ? 'Review' : step?.title}</strong>
@@ -403,12 +305,7 @@ export function Wizard({ token }: { token: string }) {
                 </div>
               );
             })}
-            <p className={`save-status${saveState === 'error' ? ' err' : ''}`} role="status" aria-live="polite">
-              {saveState === 'saving' && 'Saving…'}
-              {saveState === 'saved' && savedAt && `Saved at ${savedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`}
-              {saveState === 'error' && 'Couldn’t save. Retrying…'}
-              {saveState === 'idle' && 'Changes save automatically'}
-            </p>
+            <p className="save-status">Your answers stay in this browser tab until you submit</p>
           </nav>
 
           <div className="card">
@@ -422,9 +319,10 @@ export function Wizard({ token }: { token: string }) {
                     const i = steps.findIndex((s) => s.id === id);
                     goto(i >= 0 ? i : 0);
                   }}
-                  onSubmit={submit}
+                  onSubmit={() => void submit(true)}
                   submitting={submitting}
                   submitError={submitError}
+                  onSubmitWithoutPhotos={fileProblem ? () => void submit(false) : undefined}
                 />
               ) : (
                 step && (

@@ -80,8 +80,6 @@ export interface Field {
   defaultValue?: unknown;
   /** Render two fields side by side on wide screens */
   half?: boolean;
-  /** Text only shown to Arclo staff in the admin view, never mixed into public output */
-  internalNote?: string;
 }
 
 export interface Step {
